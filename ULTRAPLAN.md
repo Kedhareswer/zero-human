@@ -1317,6 +1317,82 @@ friendly, one `git push` to deploy the control plane.
 
 ---
 
+## 12. Free-tier (Hobby) configuration
+
+**Target: run the whole thing on free tiers, $0/month.** This overrides the
+service choices in §11 for the zero-cost path. The strategy is two-fold:
+(1) **pick the most generous free tiers**, and (2) **delete dependencies** — every
+external service is a free-tier quota to babysit, so the free build collapses to
+**three core services** and folds everything else into Postgres or the app.
+
+### 12.1 ⚠️ The honest blockers first
+
+| Limit | Reality | Consequence |
+|---|---|---|
+| **Vercel Hobby = non-commercial only** | ToS forbids commercial use on the free plan | fine for a **prototype/demo**; the day zero-human is a real product you MUST move to Pro ($20/mo). Not negotiable. |
+| **Vercel Hobby cron = once/day** | max daily frequency, ≤5 jobs | **don't use Vercel Cron** for ticks — schedule via Inngest instead |
+| **Vercel Hobby function duration** | up to 300s with Fluid Compute (30–60s default) | each Inngest **step** must finish < 300s → keep a single provider turn bounded |
+| **Inngest free = 50k runs/mo, 5 concurrent steps** | the 5-concurrent-step cap is the binding one | the free org runs **small (≈2–5 agents working at once)**; this is the real ceiling |
+| **Inngest free = 1000 steps/run** | per-function-run cap | **one Inngest run per Assignment**, not one run for the whole company lifetime |
+| **Neon free = 0.5 GB, autosuspend** | one store, cold starts | the append-only log grows → free runs are **length-bounded**; prune/export or upgrade |
+
+None of these change the architecture — they cap *scale*, and the budget +
+concurrency model already assumes a small, governed org.
+
+### 12.2 The lean free stack (3 core services)
+
+| Need | Free choice | Notes |
+|---|---|---|
+| **App + API + functions** | **Vercel Hobby** | Next.js app, API route handlers, Inngest function handlers |
+| **Durable execution** | **Inngest free** | the agent turn loop + **scheduled (cron) functions** (bypasses Hobby's daily-cron limit); 50k runs/mo |
+| **Everything stateful** | **Neon free** (Postgres + pgvector) | **one store**: event log, budget CAS, read-model, leases (advisory locks), artifacts/seeds (as text), vectors |
+| **Auth (1 governor)** | **Auth.js / NextAuth** in-app | GitHub OAuth or magic link; free, no external service, session in Neon |
+| **Model calls** | **Simulated by default ($0)** | `ScriptedAdapter` runs the whole loop with zero tokens; real Anthropic key is opt-in, guarded by the hard cap |
+
+### 12.3 What §11 services get dropped (and the free substitute)
+
+| §11 service | Free MVP substitute | Re-add when |
+|---|---|---|
+| Upstash Redis | **Neon Postgres** for read-model, rate buckets, leases (advisory locks) | hot-path read latency matters at scale |
+| Ably / Pusher | **SSE with auto-reconnect, or 2–3s polling** of the Postgres read-model; reconnect re-tails the event log | many concurrent dashboard viewers |
+| Vercel Blob | **store seeds/artifacts as text in Postgres** (markdown/code at MVP) | artifacts get large or binary |
+| Clerk | **Auth.js** (above) | you need orgs/SSO/MFA (i.e., commercial) |
+| Nango + SaaS connectors | **`web_search` / `web_fetch` only** (HTTP, no OAuth) | wiring real Slack/GitHub/Stripe writes |
+| E2B sandbox | **opt-in** — free MVP demo is a *knowledge-work* company (research/writing/planning) needing **no code execution** | you add coding agents (E2B free ≈1 concurrent — fits the 5-step cap) |
+| Browserbase | **opt-in** — `web_fetch` covers read-only research | you need real browser automation |
+
+### 12.4 The $0 demo, reframed
+
+The note-app/coding demo needs a sandbox (cost + concurrency). For a **truly free
+first demo**, run a **research-and-content company** instead — same harness,
+HTTP-only tools:
+
+> Goal: *"Produce a publish-ready market report + content plan for a note-taking
+> app."* Hire a CEO + a Web-Research analyst + a Content writer (all simulated, or
+> on a $2 real cap with a haiku-class model). Research agent runs `web_search`/
+> `web_fetch` (the `deep-research` pattern), hands a cited report to the writer
+> (handoff + review gate), writer produces content seeds, CEO reports up. Budget
+> hard-stops an agent at its cap; dashboard shows live status + burn — all on free
+> tiers, all replayable.
+
+This exercises the *entire* harness (org tree, budget CAS, handoffs, review,
+grounding via citations, observability) with **zero paid dependencies**. Add E2B +
+a coding agent later to get back to the note-app build.
+
+### 12.5 Upgrade triggers (what forces you off free)
+
+- **Going commercial** → Vercel Pro (the ToS line, not a tech limit).
+- **>5 agents working at once** or **>50k runs/mo** → Inngest paid.
+- **>0.5 GB** of events/artifacts → Neon paid (or prune/export old events).
+- **Many dashboard viewers / real-time at scale** → Ably/Pusher.
+- **Concurrent code/browser agents** → E2B / Browserbase paid.
+- **Real SaaS write-integrations** → Nango (has free/self-host) + per-connector cost.
+
+The migration is additive: each upgrade swaps one Postgres-folded concern back to
+its dedicated service (§11) without touching domain code.
+
+---
+
 ## Appendix — Adversarial critique (gaps, new risks, MVP cuts, open decisions)
 
 Output of a skeptical staff-engineer review pass. Track these; they are the
