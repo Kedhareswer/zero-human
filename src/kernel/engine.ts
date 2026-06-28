@@ -63,8 +63,8 @@ export class Engine {
   }
 
   /** Rebuild the engine's view of the org from the log. Call after setup, before run. */
-  setup(): void {
-    const events = this.store.events();
+  async setup(): Promise<void> {
+    const events = await this.store.events();
     const authoritiesByRole = new Map<string, Authorities>();
     const roleByPosition = new Map<string, string>();
     const edges: Array<{ positionId: string; parentId: string | null }> = [];
@@ -94,7 +94,7 @@ export class Engine {
   async run(rootPositionId: string, task?: string): Promise<AssignmentOutcome> {
     const meta: EventMeta = { orgId: "org", actor: "human" };
     const assignmentId = newId("asg");
-    this.store.append(
+    await this.store.append(
       {
         type: "AssignmentDispatched",
         assignmentId,
@@ -133,33 +133,33 @@ export class Engine {
       // 1. Pre-flight budget admission (atomic CAS — the kill-switch).
       const inputTokens = await this.adapter.countTokens(req);
       const estimate = estimateTurnCents(agent.model, inputTokens, this.maxOutputTokens);
-      const admit = this.store.admit(positionId, estimate);
+      const admit = await this.store.admit(positionId, estimate);
       if (!admit.ok) {
-        this.store.append({ type: "BudgetExhausted", turnId, positionId, neededCents: estimate, remainingCents: admit.remainingCents }, meta);
-        this.store.append({ type: "AgentStateChanged", positionId, state: "SUSPENDED", reason: "budget exhausted" }, meta);
+        await this.store.append({ type: "BudgetExhausted", turnId, positionId, neededCents: estimate, remainingCents: admit.remainingCents }, meta);
+        await this.store.append({ type: "AgentStateChanged", positionId, state: "SUSPENDED", reason: "budget exhausted" }, meta);
         return { status: "suspended", summary: `${agent.name} suspended (budget)` };
       }
-      this.store.append({ type: "TurnStarted", turnId, assignmentId, positionId }, meta);
-      this.store.append({ type: "BudgetReserved", turnId, positionId, amountCents: estimate }, meta);
-      this.store.append({ type: "AgentStateChanged", positionId, state: "RUNNING" }, meta);
+      await this.store.append({ type: "TurnStarted", turnId, assignmentId, positionId }, meta);
+      await this.store.append({ type: "BudgetReserved", turnId, positionId, amountCents: estimate }, meta);
+      await this.store.append({ type: "AgentStateChanged", positionId, state: "RUNNING" }, meta);
 
       // 2. Provider call (the only sanctioned egress).
       const result = await this.adapter.submitTurn(req);
 
       // 3. Post-turn settlement.
       const actual = priceUsage(result.usage);
-      this.store.settle(positionId, estimate, actual);
-      this.store.append({ type: "BudgetSettled", turnId, positionId, reserveCents: estimate, actualCents: actual, usage: result.usage }, meta);
+      await this.store.settle(positionId, estimate, actual);
+      await this.store.append({ type: "BudgetSettled", turnId, positionId, reserveCents: estimate, actualCents: actual, usage: result.usage }, meta);
 
       // 4. Append the assistant's turn to the transcript.
       if (result.assistantBlocks.length) transcript.push({ role: "assistant", blocks: result.assistantBlocks });
 
       if (result.stopReason === "refusal") {
-        this.store.append({ type: "AuditNote", message: `${positionId} refusal` }, meta);
+        await this.store.append({ type: "AuditNote", message: `${positionId} refusal` }, meta);
         break;
       }
       if (result.toolCalls.length === 0) {
-        this.store.append({ type: "AgentStateChanged", positionId, state: "IDLE" }, meta);
+        await this.store.append({ type: "AgentStateChanged", positionId, state: "IDLE" }, meta);
         break; // end_turn
       }
 
@@ -168,27 +168,27 @@ export class Engine {
       let completed = false;
 
       for (const call of result.toolCalls) {
-        this.store.append({ type: "ToolRequested", turnId, positionId, toolUseId: call.toolUseId, tool: call.tool, input: call.input }, meta);
+        await this.store.append({ type: "ToolRequested", turnId, positionId, toolUseId: call.toolUseId, tool: call.tool, input: call.input }, meta);
         const pdp = decide({ tool: call.tool, capabilities: agent.capabilities, canDelegate: agent.authorities.canDelegate });
-        this.store.append({ type: "PolicyDecided", toolUseId: call.toolUseId, decision: pdp.decision, matchedRule: pdp.matchedRule }, meta);
+        await this.store.append({ type: "PolicyDecided", toolUseId: call.toolUseId, decision: pdp.decision, matchedRule: pdp.matchedRule }, meta);
 
         if (pdp.decision === "DENY") {
           toolResults.push(this.toolResult(call.toolUseId, `DENIED (${pdp.matchedRule})`, true));
-          this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: false, summary: `denied:${pdp.matchedRule}` }, meta);
+          await this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: false, summary: `denied:${pdp.matchedRule}` }, meta);
           continue;
         }
 
         if (pdp.decision === "REQUIRE_APPROVAL") {
           const approvalId = newId("appr");
           const routedTo = this.routeApproval(positionId);
-          this.store.append({ type: "ApprovalRequested", approvalId, toolUseId: call.toolUseId, positionId, routedTo, contentHash: newId("h") }, meta);
+          await this.store.append({ type: "ApprovalRequested", approvalId, toolUseId: call.toolUseId, positionId, routedTo, contentHash: newId("h") }, meta);
           const verdict = await this.approve({ approvalId, toolUseId: call.toolUseId, positionId, tool: call.tool, input: call.input, routedTo });
           if (verdict.granted) {
-            this.store.append({ type: "ApprovalGranted", approvalId, by: verdict.by }, meta);
+            await this.store.append({ type: "ApprovalGranted", approvalId, by: verdict.by }, meta);
           } else {
-            this.store.append({ type: "ApprovalDenied", approvalId, by: verdict.by, reason: verdict.reason ?? "denied" }, meta);
+            await this.store.append({ type: "ApprovalDenied", approvalId, by: verdict.by, reason: verdict.reason ?? "denied" }, meta);
             toolResults.push(this.toolResult(call.toolUseId, `APPROVAL DENIED: ${verdict.reason ?? ""}`, true));
-            this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: false, summary: "approval-denied" }, meta);
+            await this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: false, summary: "approval-denied" }, meta);
             continue;
           }
         }
@@ -196,7 +196,7 @@ export class Engine {
         // Execute (org tool or domain tool).
         const exec = await this.execute(positionId, assignmentId, turnId, call.toolUseId, call.tool, call.input, meta);
         toolResults.push(this.toolResult(call.toolUseId, exec.summary, !exec.ok));
-        this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: exec.ok, summary: exec.summary }, meta);
+        await this.store.append({ type: "ToolExecuted", toolUseId: call.toolUseId, turnId, ok: exec.ok, summary: exec.summary }, meta);
         lastSummary = exec.summary;
         if (exec.completed) completed = true;
       }
@@ -204,8 +204,8 @@ export class Engine {
       transcript.push({ role: "user", blocks: toolResults });
 
       if (completed) {
-        this.store.append({ type: "AssignmentCompleted", assignmentId, positionId }, meta);
-        this.store.append({ type: "AgentStateChanged", positionId, state: "IDLE" }, meta);
+        await this.store.append({ type: "AssignmentCompleted", assignmentId, positionId }, meta);
+        await this.store.append({ type: "AgentStateChanged", positionId, state: "IDLE" }, meta);
         return { status: "done", summary: lastSummary };
       }
     }
@@ -229,7 +229,7 @@ export class Engine {
         return { ok: false, summary: `cannot assign to ${assignee}: not in your subtree` };
       }
       const subId = newId("asg");
-      this.store.append(
+      await this.store.append(
         { type: "AssignmentDispatched", assignmentId: subId, assignerPositionId: positionId, assigneePositionId: assignee, objectiveId: null, task: subtask, authorityBasis: "subtree" },
         { orgId: "org", actor: positionId, correlationId: assignmentId },
       );
@@ -240,7 +240,7 @@ export class Engine {
     if (tool === "submit_work") {
       const workItemId = newId("work");
       const citations = Array.isArray(input.citations) ? (input.citations as string[]) : [];
-      this.store.append(
+      await this.store.append(
         { type: "WorkSubmitted", workItemId, assignmentId, positionId, kind: String(input.kind ?? "doc"), title: String(input.title ?? "untitled"), citations },
         meta,
       );

@@ -33,42 +33,42 @@ export interface BuiltCompany {
   root: string;
 }
 
-export function buildResearchCompany(opts: { approvalResolver?: ApprovalResolver } = {}): BuiltCompany {
+export async function buildResearchCompany(opts: { approvalResolver?: ApprovalResolver } = {}): Promise<BuiltCompany> {
   const store = new InMemoryStore();
   const meta = { orgId: "org", actor: "human" };
 
-  store.append(
+  await store.append(
     { type: "OrgCreated", goal: { title: "Produce a publish-ready market report + content plan for a note-taking app." }, aggregateCapCents: 500 },
     meta,
   );
-  store.append({ type: "ObjectiveAdded", objectiveId: "obj1", title: "Ship the go-to-market package", parentId: null, weight: 100 }, meta);
+  await store.append({ type: "ObjectiveAdded", objectiveId: "obj1", title: "Ship the go-to-market package", parentId: null, weight: 100 }, meta);
 
   // Roles
-  store.append({ type: "RoleDefined", roleId: "role_ceo", name: "CEO", authorities: auth({ canHire: true, canDelegate: true, canApproveSpend: true, maxSubordinates: 8 }) }, meta);
-  store.append({ type: "RoleDefined", roleId: "role_analyst", name: "Web Research / Analyst", authorities: auth({}) }, meta);
-  store.append({ type: "RoleDefined", roleId: "role_writer", name: "Content Writer", authorities: auth({}) }, meta);
+  await store.append({ type: "RoleDefined", roleId: "role_ceo", name: "CEO", authorities: auth({ canHire: true, canDelegate: true, canApproveSpend: true, maxSubordinates: 8 }) }, meta);
+  await store.append({ type: "RoleDefined", roleId: "role_analyst", name: "Web Research / Analyst", authorities: auth({}) }, meta);
+  await store.append({ type: "RoleDefined", roleId: "role_writer", name: "Content Writer", authorities: auth({}) }, meta);
 
   // Positions (org-chart spine)
-  store.append({ type: "PositionCreated", positionId: POS.ceo, roleId: "role_ceo", parentId: null }, meta);
-  store.append({ type: "PositionCreated", positionId: POS.researcher, roleId: "role_analyst", parentId: POS.ceo }, meta);
-  store.append({ type: "PositionCreated", positionId: POS.writer, roleId: "role_writer", parentId: POS.ceo }, meta);
+  await store.append({ type: "PositionCreated", positionId: POS.ceo, roleId: "role_ceo", parentId: null }, meta);
+  await store.append({ type: "PositionCreated", positionId: POS.researcher, roleId: "role_analyst", parentId: POS.ceo }, meta);
+  await store.append({ type: "PositionCreated", positionId: POS.writer, roleId: "role_writer", parentId: POS.ceo }, meta);
 
   // Hire agents (all simulated). Writer gets a tiny cap to trigger the hard stop.
   // Agents are simulated (ScriptedAdapter makes no API calls = $0 real cost), but
   // priced as if served by the named model so the budget board shows real dollars.
   const sys = (pos: string, persona: string) => `[pos:${pos}] ${persona}`;
-  store.append({ type: "AgentHired", positionId: POS.ceo, agentId: "a_ceo", name: "Ada (CEO)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.ceo, "You run the company toward the goal."), monthlyCapCents: 100, capabilities: [] }, meta);
-  store.append({ type: "AgentHired", positionId: POS.researcher, agentId: "a_res", name: "Ravi (Analyst)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.researcher, "You produce cited research."), monthlyCapCents: 100, capabilities: ["web_search", "web_fetch", "write_doc"] }, meta);
-  store.append({ type: "AgentHired", positionId: POS.writer, agentId: "a_wri", name: "Wren (Writer)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.writer, "You turn research into content."), monthlyCapCents: 18, capabilities: ["write_doc"] }, meta);
+  await store.append({ type: "AgentHired", positionId: POS.ceo, agentId: "a_ceo", name: "Ada (CEO)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.ceo, "You run the company toward the goal."), monthlyCapCents: 100, capabilities: [] }, meta);
+  await store.append({ type: "AgentHired", positionId: POS.researcher, agentId: "a_res", name: "Ravi (Analyst)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.researcher, "You produce cited research."), monthlyCapCents: 100, capabilities: ["web_search", "web_fetch", "write_doc"] }, meta);
+  await store.append({ type: "AgentHired", positionId: POS.writer, agentId: "a_wri", name: "Wren (Writer)", provider: "claude", model: "claude-opus-4-8", systemPrompt: sys(POS.writer, "You turn research into content."), monthlyCapCents: 18, capabilities: ["write_doc"] }, meta);
 
   // Strategy approval gate -> RUNNING
-  store.append({ type: "StrategyApproved", approvedBy: "human", contentHash: "h0" }, meta);
-  store.append({ type: "OrgStateChanged", state: "RUNNING" }, meta);
+  await store.append({ type: "StrategyApproved", approvedBy: "human", contentHash: "h0" }, meta);
+  await store.append({ type: "OrgStateChanged", state: "RUNNING" }, meta);
 
   // Initialize the authoritative budget from each hire cap.
-  store.initBudget(POS.ceo, 100);
-  store.initBudget(POS.researcher, 100);
-  store.initBudget(POS.writer, 18);
+  await store.initBudget(POS.ceo, 100);
+  await store.initBudget(POS.researcher, 100);
+  await store.initBudget(POS.writer, 18);
 
   const u = (inT: number, outT: number) => ({ inputTokens: inT, outputTokens: outT });
 
@@ -98,7 +98,7 @@ export function buildResearchCompany(opts: { approvalResolver?: ApprovalResolver
   const adapter = new ScriptedAdapter(script, positionOf);
   const registry = defaultToolRegistry();
   const engine = new Engine(store, adapter, registry, { maxOutputTokens: 4000, maxTurnsPerAssignment: 6, approvalResolver: opts.approvalResolver });
-  engine.setup();
+  await engine.setup();
 
   return { store, engine, root: POS.ceo };
 }

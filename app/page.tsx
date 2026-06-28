@@ -1,13 +1,17 @@
 import { dollars } from "../src/core/pricing";
-import { runDemoSnapshot } from "../src/demo/snapshot";
+import { snapshotOf } from "../src/demo/snapshot";
+import { getRuntime } from "../src/server/runtime";
+import { ReviewActions } from "./components/ReviewActions";
 
-// Server component: runs the $0 simulated company on each request and renders the
-// dashboard from the folded event log. On Vercel this runs in a serverless
-// function; in production the run lives in an Inngest durable function (see §11).
+// Server component: reads the shared runtime event log (built + run once) and
+// renders the dashboard from fold(events). Review actions mutate the same log.
+// On Vercel this runs in a serverless function; production runs the loop in an
+// Inngest durable function (ULTRAPLAN §11) over the Neon store.
 export const dynamic = "force-dynamic";
 
 export default async function Page() {
-  const s = await runDemoSnapshot();
+  const { store, root } = await getRuntime();
+  const s = await snapshotOf(store, root);
 
   return (
     <main className="wrap">
@@ -71,7 +75,7 @@ export default async function Page() {
                     <td>{w.title} <span style={{ color: "var(--muted)" }}>({w.kind})</span></td>
                     <td className="mono">{w.positionId}</td>
                     <td className="r mono">{w.citations}</td>
-                    <td><span className={`tag ${w.status}`}>{w.status.replace("_", " ")}</span></td>
+                    <td><ReviewActions workItemId={w.workItemId} status={w.status} /></td>
                   </tr>
                 ))}
                 {s.workItems.length === 0 && <tr><td colSpan={4} style={{ color: "var(--muted)" }}>none</td></tr>}

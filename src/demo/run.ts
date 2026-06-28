@@ -6,12 +6,12 @@ import { dollars } from "../core/pricing";
 import { buildResearchCompany } from "./company";
 
 async function main(): Promise<void> {
-  const { store, engine, root } = buildResearchCompany();
+  const { store, engine, root } = await buildResearchCompany();
 
   console.log("\n=== zero-human · $0 simulated run ===\n");
   const outcome = await engine.run(root);
 
-  const ws = fold(store.events());
+  const ws = fold(await store.events());
 
   console.log(`Goal:  ${ws.org.goal.title}`);
   console.log(`State: ${ws.org.state}   ·   CEO outcome: ${outcome.status} (${outcome.summary})\n`);

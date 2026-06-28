@@ -5,10 +5,11 @@ import { buildResearchCompany } from "../src/demo/company";
 
 describe("fold(events) is the single source of read-state", () => {
   it("is deterministic: folding the same log twice yields identical numbers", async () => {
-    const { store, engine, root } = buildResearchCompany();
+    const { store, engine, root } = await buildResearchCompany();
     await engine.run(root);
-    const a = fold(store.events());
-    const b = fold(store.events());
+    const events = await store.events();
+    const a = fold(events);
+    const b = fold(events);
     for (const [pos, av] of a.agents) {
       expect(b.agents.get(pos)!.usedCents).toBeCloseTo(av.usedCents, 9);
       expect(b.agents.get(pos)!.state).toBe(av.state);
@@ -17,11 +18,11 @@ describe("fold(events) is the single source of read-state", () => {
   });
 
   it("reconstructs budgets that match the authoritative store", async () => {
-    const { store, engine, root } = buildResearchCompany();
+    const { store, engine, root } = await buildResearchCompany();
     await engine.run(root);
-    const ws = fold(store.events());
+    const ws = fold(await store.events());
     for (const [pos, av] of ws.agents) {
-      const authoritative = store.budget(pos)!;
+      const authoritative = (await store.budget(pos))!;
       expect(av.usedCents).toBeCloseTo(authoritative.usedCents, 9);
     }
   });
@@ -29,20 +30,20 @@ describe("fold(events) is the single source of read-state", () => {
 
 describe("tamper-evident audit log", () => {
   it("the hash chain verifies end to end", async () => {
-    const { store, engine, root } = buildResearchCompany();
+    const { store, engine, root } = await buildResearchCompany();
     await engine.run(root);
-    expect(verifyChain(store.events())).toBe(true);
+    expect(verifyChain(await store.events())).toBe(true);
   });
 });
 
 describe("deterministic replay (structural)", () => {
   it("two independent runs produce the same event-type sequence and budgets", async () => {
     const run = async () => {
-      const { store, engine, root } = buildResearchCompany();
+      const { store, engine, root } = await buildResearchCompany();
       await engine.run(root);
-      const ws = fold(store.events());
+      const ws = fold(await store.events());
       return {
-        types: store.events().map((e) => e.type),
+        types: (await store.events()).map((e) => e.type),
         used: [...ws.agents.values()].map((a) => Math.round(a.usedCents * 100)),
         breaches: ws.capBreaches,
       };

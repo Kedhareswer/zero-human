@@ -1,10 +1,11 @@
 // The event log + the authoritative budget state. The kernel is the only thing
-// that mutates either. Budget admission is a SYNCHRONOUS check-and-reserve (the
-// one deliberate exception to the async log) — that's what makes the hard cap a
-// real kill-switch and not a dashboard chart.
+// that mutates either. Budget admission is an atomic check-and-reserve (the one
+// place correctness depends on a synchronous-equivalent CAS) — that's what makes
+// the hard cap a real kill-switch and not a dashboard chart.
 //
-// The clock is logical (ts === seq): ordering is by harness-assigned seq, never
-// wall-clock, so the whole log is deterministic and replayable.
+// The Store interface is async so the same engine runs over the in-memory store
+// (tests, $0 demo) and the Neon Postgres store (production) unchanged. The clock
+// is logical (ts === seq): ordering is by harness-assigned seq, never wall-clock.
 
 import { payloadOf, type EventMeta, type EventPayload, type StoredEvent } from "../core/events";
 import { computeHash, GENESIS_HASH } from "../core/hashchain";
@@ -15,21 +16,21 @@ export interface AdmitResult {
   remainingCents: number;
 }
 
-export interface Store {
-  append(payload: EventPayload, meta: EventMeta): StoredEvent;
-  events(): StoredEvent[];
-  initBudget(positionId: string, capCents: number): void;
-  /** Atomic pre-flight: reserve `amountCents` iff it fits under the cap. */
-  admit(positionId: string, amountCents: number): AdmitResult;
-  /** Post-turn settlement: release the reservation, charge the actual spend. */
-  settle(positionId: string, reserveCents: number, actualCents: number): void;
-  budget(positionId: string): { capCents: number; usedCents: number; reservedCents: number } | undefined;
-}
-
-interface Budget {
+export interface Budget {
   capCents: number;
   usedCents: number;
   reservedCents: number;
+}
+
+export interface Store {
+  append(payload: EventPayload, meta: EventMeta): Promise<StoredEvent>;
+  events(): Promise<StoredEvent[]>;
+  initBudget(positionId: string, capCents: number): Promise<void>;
+  /** Atomic pre-flight: reserve `amountCents` iff it fits under the cap. */
+  admit(positionId: string, amountCents: number): Promise<AdmitResult>;
+  /** Post-turn settlement: release the reservation, charge the actual spend. */
+  settle(positionId: string, reserveCents: number, actualCents: number): Promise<void>;
+  budget(positionId: string): Promise<Budget | undefined>;
 }
 
 const EPS = 1e-6;
@@ -40,16 +41,11 @@ export class InMemoryStore implements Store {
   private seq = 0;
   private lastHash = GENESIS_HASH;
 
-  append(payload: EventPayload, meta: EventMeta): StoredEvent {
+  async append(payload: EventPayload, meta: EventMeta): Promise<StoredEvent> {
+    // No await before the writes below: the body runs to completion synchronously,
+    // so seq/hash assignment is race-free even when callers fire many appends.
     const seq = this.seq++;
-    const core = {
-      seq,
-      ts: seq, // logical clock
-      orgId: meta.orgId,
-      actor: meta.actor,
-      correlationId: meta.correlationId,
-      payload,
-    };
+    const core = { seq, ts: seq, orgId: meta.orgId, actor: meta.actor, correlationId: meta.correlationId, payload };
     const hash = computeHash(this.lastHash, core);
     const event = {
       ...payload,
@@ -67,32 +63,30 @@ export class InMemoryStore implements Store {
     return event;
   }
 
-  events(): StoredEvent[] {
+  async events(): Promise<StoredEvent[]> {
     return this.log;
   }
 
-  initBudget(positionId: string, capCents: number): void {
+  async initBudget(positionId: string, capCents: number): Promise<void> {
     this.budgets.set(positionId, { capCents, usedCents: 0, reservedCents: 0 });
   }
 
-  budget(positionId: string) {
+  async budget(positionId: string): Promise<Budget | undefined> {
     return this.budgets.get(positionId);
   }
 
-  admit(positionId: string, amountCents: number): AdmitResult {
-    // SYNCHRONOUS critical section — no await between read and write, so two
-    // concurrent turns racing the last dollar can never both be admitted.
+  async admit(positionId: string, amountCents: number): Promise<AdmitResult> {
+    // Critical section — no await between read and write, so two concurrent turns
+    // racing the last dollar can never both be admitted.
     const b = this.budgets.get(positionId);
     if (!b) return { ok: false, remainingCents: 0 };
     const remaining = b.capCents - b.usedCents - b.reservedCents;
-    if (remaining - amountCents < -EPS) {
-      return { ok: false, remainingCents: remaining };
-    }
+    if (remaining - amountCents < -EPS) return { ok: false, remainingCents: remaining };
     b.reservedCents += amountCents;
     return { ok: true, remainingCents: b.capCents - b.usedCents - b.reservedCents };
   }
 
-  settle(positionId: string, reserveCents: number, actualCents: number): void {
+  async settle(positionId: string, reserveCents: number, actualCents: number): Promise<void> {
     const b = this.budgets.get(positionId);
     if (!b) return;
     b.reservedCents = Math.max(0, b.reservedCents - reserveCents);
@@ -101,7 +95,7 @@ export class InMemoryStore implements Store {
 }
 
 /** The canonical hashed core for an event — identical shape to what append() hashes. */
-function eventCore(e: StoredEvent) {
+export function eventCore(e: StoredEvent) {
   return { seq: e.seq, ts: e.ts, orgId: e.orgId, actor: e.actor, correlationId: e.correlationId, payload: payloadOf(e) };
 }
 
