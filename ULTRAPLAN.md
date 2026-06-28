@@ -966,6 +966,11 @@ human signs.
 That shape — not raw compute — picks the stack. The choices below are stated
 plainly and incorporate the load-bearing amendments from the stack red-team.
 
+> **Deployment update (2026-06-28): target is Vercel.** The infra/runtime rows
+> below (runtime host, queue/scheduler, realtime, DB host, Redis, deploy) are
+> **superseded by §11**. The *language, domain model, adapters, budget-CAS SQL,
+> sandbox, and browser choices are unchanged* — only where/how it runs changes.
+
 ### 9.0 The headline decision, stated plainly
 
 **The entire online backend — kernel, API, queue workers, projections,
@@ -1179,6 +1184,136 @@ assert the company comes out identical. That is simultaneously the audit log, th
 observability feed, and the regression test, and it is the whole difference
 between *running a company* and *writing a convincing story about running a
 company*.
+
+---
+
+## 11. Deployment architecture — Vercel
+
+**Decision: deploy on Vercel.** This supersedes the infra/runtime rows of §9.
+The domain model, event-sourcing, supervisor-tree, leaf budget-CAS *SQL*,
+kernel-as-sole-effector, Position≠Agent, TypeScript, the Anthropic adapter, E2B,
+and Browserbase are all **unchanged**. What changes is the execution topology,
+because Vercel is serverless: **functions are time-bounded and there are no
+always-on workers.**
+
+### 11.1 The one hard constraint and the fix
+
+Vercel Functions (with Fluid Compute) cap at **800s on Pro** (1800s beta), **300s
+on Hobby**; I/O wait (model calls, DB) is **not** billed as active CPU — good for
+agent work. But a full agent loop is *many* turns plus approval waits that can
+last **hours or days** — that cannot live inside one invocation, and there is no
+persistent process to host BullMQ.
+
+**Fix: split the control plane from the execution plane.**
+
+```
+                    ┌──────────────────── VERCEL ────────────────────┐
+  Human  ─────────► │ Next.js dashboard (RSC) · API route handlers ·  │
+  (browser)         │ webhook ingest (Stripe/GA/GitHub) · Vercel Cron │
+                    └───────┬───────────────────────────────┬─────────┘
+                            │ emits events / commands         │ subscribes
+                            ▼                                 ▼
+                   ┌──────────────────┐            ┌────────────────────┐
+                   │ INNGEST (durable │            │ Managed realtime    │
+                   │ execution)       │            │ (Ably / Pusher)     │
+                   │ = the agent turn │            │ kernel→dashboard     │
+                   │   loop, as steps │            │ live event fan-out  │
+                   └───┬────────┬─────┘            └────────────────────┘
+       kernel logic    │        │ external effects (HTTP, callable from serverless)
+   (runs AS Inngest    │        ├─► Anthropic (provider streams)
+    functions on       │        ├─► E2B microVM sandbox (untrusted code)
+    Vercel infra)      │        ├─► Browserbase (browser)
+                       ▼        └─► Nango → SaaS connectors
+              ┌──────────────────┐        ┌──────────────────┐
+              │ Neon Postgres    │        │ Upstash Redis     │
+              │ (event log,      │        │ (hot read-model,  │
+              │  budget CAS,     │        │  rate buckets,    │
+              │  pgvector)       │        │  leases)          │
+              └──────────────────┘        └──────────────────┘
+```
+
+The kernel code still lives in the repo; it just **executes as Inngest step
+functions** (deployed on Vercel) instead of as a long-lived worker.
+
+### 11.2 The turn loop as durable steps (this is the win)
+
+Each agent turn = one Inngest **step** (memoized, retried independently). The loop
+the kernel ran in-process becomes a durable function:
+
+```
+inngest.createFunction({ id: "agent-turn-loop",
+  concurrency: [{ key: "event.data.providerKey", limit: N },     // per-provider rate cap
+                { key: "event.data.orgId" }] },                  // per-org fairness
+  { event: "agent/assignment.dispatched" },
+  async ({ event, step }) => {
+    while (!done) {
+      // pre-flight budget CAS — single SQL UPDATE over Neon HTTP driver (autocommit)
+      const ok = await step.run("budget-admit", () => admitCAS(agent, estimate))
+      if (!ok) return step.run("suspend", () => suspend(agent, "BudgetExhausted"))
+      // provider call — mostly I/O wait, fits in one Fluid-Compute invocation
+      const turn = await step.run("provider-turn", () => adapter.submitTurn(req))
+      for (const call of turn.toolCalls) {
+        const decision = await step.run("pdp", () => pdp(call))           // deterministic gate
+        if (decision === "REQUIRE_APPROVAL")
+          await step.waitForEvent("approval", {                          // ⭐ parks for DAYS,
+            event: "approval/granted", match: "data.callId", timeout: "3d" }) //  holds NO process
+        await step.run("tool", () => kernel.runTool(call))
+      }
+      await step.run("settle", () => settleBudget(agent, turn.usage))     // post-turn meter
+    }
+  })
+```
+
+Why this is *better* than the BullMQ design, not just a workaround:
+- **`step.waitForEvent` = "approvals park durably, never block the org"** — for
+  free, surviving hours/days, holding zero compute. The hardest property in §6/§8
+  becomes a primitive.
+- **Step memoization = idempotency on retry** — a completed `tool`/`settle` step
+  isn't re-run, hardening the "don't double-fire an irreversible effect" rule.
+- **Concurrency keys** give per-provider rate-limit admission and per-org
+  fairness — closing the "shared provider rate-limit" gap the critique flagged.
+- **Fan-out** (`step.sendEvent` to dispatch subordinate assignments) is native →
+  the supervisor-tree's downward cascade maps to event fan-out.
+
+### 11.3 Revised stack rows (delta vs §9)
+
+| Layer | §9 (was) | §11 (Vercel) | Why |
+|---|---|---|---|
+| **Runtime host** | Node services on Fly/ECS holding long streams | **Vercel Functions (Fluid Compute)** for UI/API/short streams + **Inngest** for the durable turn loop | no always-on process on Vercel; durable engine owns the loop |
+| **Queue / scheduler** | BullMQ on Redis | **Inngest** (steps, concurrency, throttle, cron, `waitForEvent`) + **Vercel Cron** for ticks | BullMQ needs a persistent worker; Inngest is serverless-native and event-driven like our log |
+| **Realtime → dashboard** | self-run SSE fan-out | **Managed realtime (Ably or Pusher)**; kernel publishes, dashboard subscribes; reconnect = history-from-log + tail. Short single-agent token streams may still use a Route Handler stream | long-lived SSE in a time-bounded function is fragile |
+| **Primary datastore** | Postgres (RDS/Neon) | **Neon** (serverless Postgres) + pgvector; **budget CAS via the Neon HTTP driver as a single autocommit `UPDATE…RETURNING`** (no long txn); pooled connection for multi-statement work | serverless fan-out → pooling is mandatory; the leaf-CAS is one statement, ideal for HTTP driver |
+| **Redis** | self-managed Redis | **Upstash Redis** (HTTP/serverless) for hot read-model, rate buckets, leases | no persistent Redis client on serverless |
+| **Auth** | WorkOS/Auth0 | **Clerk** (Vercel-native) or WorkOS | both fine; Clerk is the smoothest Vercel path |
+| **Object storage** | S3/R2 | **Vercel Blob** or R2 | keep blobs off Postgres; refs+hash in the log |
+| **Deploy** | containers on Fly/ECS | **Vercel** (app + API + Inngest fns) + Neon + Upstash + Ably + external E2B/Browserbase/Nango | one Vercel-centric control plane; dangerous/long work stays in external managed services |
+
+**Unchanged from §9:** TypeScript everywhere · `packages/core` event union · Anthropic
+SDK behind `ProviderAdapter` · leaf budget-CAS *logic* · E2B microVM sandbox ·
+Browserbase + Playwright · Next.js + React Flow dashboard · the hash-chained
+event log as the source of truth.
+
+### 11.4 Honest trade-offs of going Vercel-first
+
+- **Inngest (or Trigger.dev) is now mandatory, not optional** — it *is* the
+  execution plane. If you'd rather keep one vendor and run long single tasks
+  without step-splitting, **Trigger.dev** (dedicated infra, no timeout,
+  self-hostable) is the swap-in; Inngest is recommended for the event-driven fit.
+- **DB connections under fan-out** must go through the Neon pooler / HTTP driver,
+  or wide agent fan-out exhausts connections — design for it from day one.
+- **Realtime is a managed dependency** (Ably/Pusher) rather than self-run SSE.
+- **Cost shape:** Fluid Compute bills active CPU (not I/O wait), so streaming a
+  model is cheap; the new line items are Inngest runs + realtime messages — fine
+  at MVP, model them at scale.
+- **What does NOT change:** every safety property (kernel-sole-effector, hard
+  budget cap, audit log, approval gates, replayable fixtures) is preserved —
+  they're architecture, not host.
+
+### 11.5 MVP deployment shape
+
+Vercel (Next.js + API + Inngest functions) · Inngest Cloud · Neon · Upstash ·
+Ably · E2B · Browserbase · Clerk · Vercel Blob. All managed, all serverless-
+friendly, one `git push` to deploy the control plane.
 
 ---
 
